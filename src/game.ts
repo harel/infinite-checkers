@@ -31,7 +31,7 @@ export interface Move {
   captures: Coord[];
 }
 
-export type GameMode = "pvp" | "cpu";
+export type GameMode = "pvp" | "cpu" | "online";
 
 export interface GameState {
   board: Board;
@@ -399,38 +399,97 @@ export function createGame(mode: GameMode, humanPlayer: Player = "red"): GameSta
   };
 }
 
+/** Board snapshot for network sync (legal moves recomputed on receive). */
+export interface WireState {
+  board: Board;
+  turn: Player;
+  status: GameState["status"];
+  lastMove: Move | null;
+}
+
+export function toWireState(state: GameState): WireState {
+  return {
+    board: state.board,
+    turn: state.turn,
+    status: state.status,
+    lastMove: state.lastMove,
+  };
+}
+
+export function fromWireState(
+  wire: WireState,
+  mode: GameMode,
+  humanPlayer: Player,
+): GameState {
+  return {
+    board: wire.board,
+    turn: wire.turn,
+    status: wire.status,
+    lastMove: wire.lastMove,
+    selected: null,
+    legalMoves:
+      wire.status === "playing" ? getAllMoves(wire.board, wire.turn) : [],
+    mode,
+    humanPlayer,
+    mustContinue: null,
+  };
+}
+
+export function movesEqual(a: Move, b: Move): boolean {
+  if (!sameCoord(a.from, b.from) || !sameCoord(a.to, b.to)) return false;
+  if (a.captures.length !== b.captures.length) return false;
+  return a.captures.every((c, i) => sameCoord(c, b.captures[i]));
+}
+
+export function findLegalMove(state: GameState, move: Move): Move | null {
+  return state.legalMoves.find((m) => movesEqual(m, move)) ?? null;
+}
+
 export function movesFrom(state: GameState, from: Coord): Move[] {
   return state.legalMoves.filter((m) => sameCoord(m.from, from));
 }
 
 export function selectSquare(state: GameState, coord: Coord): GameState {
-  if (state.status !== "playing") return state;
+  return selectSquareResult(state, coord).state;
+}
+
+export interface SelectResult {
+  state: GameState;
+  /** Set when the click completed a move (before/with commit applied in state). */
+  move: Move | null;
+}
+
+/**
+ * Click handling: select a piece or choose a destination.
+ * When a move is completed, `move` is set and `state` already has it committed.
+ */
+export function selectSquareResult(state: GameState, coord: Coord): SelectResult {
+  if (state.status !== "playing") return { state, move: null };
 
   const piece = state.board[coord.row][coord.col];
   if (piece && piece.player === state.turn) {
     const fromMoves = movesFrom(state, coord);
     if (fromMoves.length === 0) {
-      return { ...state, selected: null };
+      return { state: { ...state, selected: null }, move: null };
     }
-    return { ...state, selected: coord };
+    return { state: { ...state, selected: coord }, move: null };
   }
 
-  if (!state.selected) return state;
+  if (!state.selected) return { state, move: null };
 
   const candidates = movesFrom(state, state.selected).filter((m) =>
     sameCoord(m.to, coord),
   );
   if (candidates.length === 0) {
-    // Click elsewhere: deselect or select other piece
     if (piece && piece.player === state.turn) {
-      return selectSquare({ ...state, selected: null }, coord);
+      return selectSquareResult({ ...state, selected: null }, coord);
     }
-    return { ...state, selected: null };
+    return { state: { ...state, selected: null }, move: null };
   }
 
-  // Prefer longest capture if multiple landings match
   candidates.sort((a, b) => b.captures.length - a.captures.length);
-  return commitMove(state, candidates[0]);
+  const move = candidates[0];
+  return { state: commitMove(state, move), move };
 }
 
 export function commitMove(state: GameState, move: Move): GameState {

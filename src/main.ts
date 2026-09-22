@@ -10,22 +10,56 @@ import {
   coordKey,
   createGame,
   fileLabel,
+  findLegalMove,
+  fromWireState,
   isPlayable,
   movesFrom,
   rankLabel,
   sameCoord,
-  selectSquare,
+  selectSquareResult,
 } from "./game";
+import {
+  ConnectionStatus,
+  OnlineSession,
+  clearRoomFromUrl,
+  roomCodeFromUrl,
+  roomLink,
+} from "./online";
 
-type Screen = "menu" | "play";
+type Screen = "menu" | "online-lobby" | "play";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
 let screen: Screen = "menu";
 let state: GameState | null = null;
 let cpuThinking = false;
+let online: OnlineSession | null = null;
+let onlineStatus: ConnectionStatus = "idle";
+let onlineDetail = "";
+let lobbyMode: "create" | "join" = "create";
+let joinCodeInput = "";
+let copyFeedback = "";
+
+function myOnlineColor(): Player | null {
+  if (!online) return null;
+  return online.role === "host" ? "red" : "black";
+}
+
+function isMyOnlineTurn(): boolean {
+  if (!state || !online) return false;
+  return state.turn === myOnlineColor();
+}
+
+function destroyOnline(): void {
+  online?.destroy();
+  online = null;
+  onlineStatus = "idle";
+  onlineDetail = "";
+  copyFeedback = "";
+}
 
 function startGame(mode: GameMode, human: Player = "red"): void {
+  if (mode !== "online") destroyOnline();
   state = createGame(mode, human);
   screen = "play";
   cpuThinking = false;
@@ -34,17 +68,154 @@ function startGame(mode: GameMode, human: Player = "red"): void {
 }
 
 function backToMenu(): void {
+  destroyOnline();
+  clearRoomFromUrl();
   state = null;
   screen = "menu";
   cpuThinking = false;
+  joinCodeInput = "";
+  render();
+}
+
+function openOnlineLobby(mode: "create" | "join", presetCode = ""): void {
+  destroyOnline();
+  lobbyMode = mode;
+  joinCodeInput = presetCode;
+  screen = "online-lobby";
+  onlineStatus = "idle";
+  onlineDetail = "";
+  render();
+
+  if (mode === "create") {
+    beginHost();
+  }
+}
+
+function beginHost(): void {
+  state = createGame("online", "red");
+  online = OnlineSession.host({
+    onStatus: handleOnlineStatus,
+    onMessage: handleOnlineMessage,
+  });
+}
+
+function beginGuest(code: string): void {
+  online = OnlineSession.join(code, {
+    onStatus: handleOnlineStatus,
+    onMessage: handleOnlineMessage,
+  });
+}
+
+function handleOnlineStatus(status: ConnectionStatus, detail = ""): void {
+  onlineStatus = status;
+  onlineDetail = detail;
+  if (status === "error" || status === "disconnected") {
+    render();
+    return;
+  }
+  if (status === "connected" && online?.role === "host" && state) {
+    // Wait for hello before welcome — still re-render lobby/play
+  }
+  render();
+}
+
+function handleOnlineMessage(msg: import("./online").OnlineMessage): void {
+  if (!online) return;
+
+  switch (msg.type) {
+    case "hello":
+      if (online.role === "host" && state) {
+        online.sendWelcome(state);
+        screen = "play";
+        render();
+      }
+      break;
+    case "welcome":
+      if (online.role === "guest") {
+        state = fromWireState(msg.state, "online", "black");
+        screen = "play";
+        clearRoomFromUrl();
+        render();
+      }
+      break;
+    case "state":
+      if (state) {
+        const human = myOnlineColor() ?? state.humanPlayer;
+        state = fromWireState(msg.state, "online", human);
+        screen = "play";
+        render();
+      }
+      break;
+    case "move":
+      if (online.role === "host" && state) {
+        applyHostRemoteMove(msg.move);
+      }
+      break;
+    case "rematch":
+      if (online.role === "host") {
+        state = createGame("online", "red");
+        online.sendState(state);
+        screen = "play";
+        render();
+      }
+      break;
+    case "resync":
+      if (online.role === "host" && state) {
+        online.sendState(state);
+      }
+      break;
+    case "bye":
+      onlineStatus = "disconnected";
+      onlineDetail = "Opponent left.";
+      render();
+      break;
+    case "reject":
+      onlineStatus = "error";
+      onlineDetail = msg.reason;
+      destroyOnline();
+      render();
+      break;
+  }
+}
+
+function applyHostRemoteMove(move: Move): void {
+  if (!state || !online || online.role !== "host") return;
+  if (state.turn !== "black") return;
+  const legal = findLegalMove(state, move);
+  if (!legal) {
+    online.sendState(state);
+    return;
+  }
+  state = commitMove(state, legal);
+  online.sendState(state);
   render();
 }
 
 function onSquareClick(row: number, col: number): void {
   if (!state || state.status !== "playing" || cpuThinking) return;
   if (state.mode === "cpu" && state.turn !== state.humanPlayer) return;
+  if (state.mode === "online") {
+    if (onlineStatus !== "connected" || !online) return;
+    if (!isMyOnlineTurn()) return;
+  }
 
-  state = selectSquare(state, { row, col });
+  const result = selectSquareResult(state, { row, col });
+
+  if (state.mode === "online" && online && result.move) {
+    if (online.role === "host") {
+      state = result.state;
+      online.sendState(state);
+      render();
+      return;
+    }
+    // Guest: send move, clear local selection; wait for host state
+    online.sendMove(result.move);
+    state = { ...state, selected: null };
+    render();
+    return;
+  }
+
+  state = result.state;
   render();
   maybeCpuTurn();
 }
@@ -57,7 +228,6 @@ function maybeCpuTurn(): void {
   cpuThinking = true;
   render();
 
-  // Yield so the UI can paint "thinking"
   window.setTimeout(() => {
     if (!state) return;
     const move = chooseCpuMove(state, 3);
@@ -69,13 +239,32 @@ function maybeCpuTurn(): void {
   }, 380);
 }
 
+function requestOnlineRematch(): void {
+  if (!online || !state) return;
+  if (online.role === "host") {
+    state = createGame("online", "red");
+    online.sendState(state);
+    render();
+  } else {
+    online.sendMessage({ type: "rematch" });
+  }
+}
+
 function statusText(s: GameState): string {
   if (s.status === "red-wins") return "Red wins!";
   if (s.status === "black-wins") return "Black wins!";
   if (s.status === "draw") return "Draw.";
 
+  if (s.mode === "online" && onlineStatus !== "connected") {
+    return onlineDetail || "Waiting for connection…";
+  }
+
   if (cpuThinking) {
     return `<span class="cpu-thinking">CPU is thinking…</span>`;
+  }
+
+  if (s.mode === "online" && !isMyOnlineTurn()) {
+    return "Waiting for opponent…";
   }
 
   const hasCaptures = s.legalMoves.some((m) => m.captures.length > 0);
@@ -90,7 +279,41 @@ function turnName(s: GameState): string {
     if (s.turn === s.humanPlayer) return "Your turn";
     return "CPU's turn";
   }
+  if (s.mode === "online") {
+    if (isMyOnlineTurn()) return "Your turn";
+    return "Opponent's turn";
+  }
   return s.turn === "red" ? "Red to move" : "Black to move";
+}
+
+function connectionBadge(): string {
+  if (!online) return "";
+  const label =
+    onlineStatus === "connected"
+      ? "Online"
+      : onlineStatus === "waiting"
+        ? "Waiting"
+        : onlineStatus === "connecting"
+          ? "Connecting"
+          : onlineStatus === "disconnected"
+            ? "Disconnected"
+            : onlineStatus === "error"
+              ? "Error"
+              : "Online";
+  return `<span class="conn-badge ${onlineStatus}" title="${escapeAttr(onlineDetail)}">${label}</span>`;
+}
+
+function escapeAttr(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+function renderCredits(): string {
+  return `
+    <footer class="credits">
+      Game conceived by Harel Malka &amp; Amit Shani.
+      Created by Harel Malka @ <a href="https://ourea.io" target="_blank" rel="noopener noreferrer">Ourea</a>.
+    </footer>
+  `;
 }
 
 function renderMenu(): string {
@@ -104,6 +327,14 @@ function renderMenu(): string {
         </p>
       </header>
       <div class="mode-grid">
+        <button class="mode-card" data-action="online-create" type="button">
+          <h2>Play online</h2>
+          <p>Create a room and share a code with a friend. You play Red.</p>
+        </button>
+        <button class="mode-card" data-action="online-join" type="button">
+          <h2>Join room</h2>
+          <p>Enter a room code to play Black against the host.</p>
+        </button>
         <button class="mode-card" data-mode="pvp" type="button">
           <h2>Two players</h2>
           <p>Pass-and-play on one screen. Red moves first.</p>
@@ -124,12 +355,74 @@ function renderMenu(): string {
         yourself. Captures wrap freely. Reach the far rank across the board to
         promote. Queens slide any distance. Captures are mandatory.
       </aside>
+      ${renderCredits()}
     </div>
   `;
 }
 
+function renderOnlineLobby(): string {
+  if (lobbyMode === "create") {
+    const code = online?.roomCode ?? "······";
+    const link = online ? roomLink(online.roomCode) : "";
+    return `
+      <div class="screen lobby">
+        <header class="hero">
+          <h1 class="brand">Online room</h1>
+          <p class="tagline">Share this code or link. Keep this tab open — you’re the host (Red).</p>
+        </header>
+        <div class="panel lobby-panel">
+          <p class="lobby-label">Room code</p>
+          <p class="room-code" aria-live="polite">${code}</p>
+          <div class="actions">
+            <button class="btn primary" data-action="copy-code" type="button" ${online ? "" : "disabled"}>Copy code</button>
+            <button class="btn" data-action="copy-link" type="button" ${online ? "" : "disabled"}>Copy link</button>
+          </div>
+          ${copyFeedback ? `<p class="copy-feedback">${copyFeedback}</p>` : ""}
+          <p class="status-line">${onlineDetail || statusForLobby()}</p>
+          ${link ? `<p class="lobby-link"><code>${link}</code></p>` : ""}
+          <div class="actions lobby-cancel">
+            <button class="btn" data-action="menu" type="button">Cancel</button>
+          </div>
+        </div>
+        ${renderCredits()}
+      </div>
+    `;
+  }
+
+  return `
+    <div class="screen lobby">
+      <header class="hero">
+        <h1 class="brand">Join room</h1>
+        <p class="tagline">Enter the host’s room code. You’ll play Black.</p>
+      </header>
+      <div class="panel lobby-panel">
+        <label class="lobby-label" for="room-code-input">Room code</label>
+        <input id="room-code-input" class="room-input" type="text" maxlength="8" autocomplete="off" spellcheck="false" value="${escapeAttr(joinCodeInput)}" placeholder="e.g. K7M2QX" />
+        <div class="actions">
+          <button class="btn primary" data-action="join-submit" type="button">Join</button>
+          <button class="btn" data-action="menu" type="button">Cancel</button>
+        </div>
+        <p class="status-line ${onlineStatus === "error" ? "win" : ""}">${onlineDetail || statusForLobby()}</p>
+      </div>
+      ${renderCredits()}
+    </div>
+  `;
+}
+
+function statusForLobby(): string {
+  if (onlineStatus === "connecting") return "Connecting…";
+  if (onlineStatus === "waiting") return "Waiting for opponent to join…";
+  if (onlineStatus === "connected") return "Connected!";
+  if (onlineStatus === "error") return onlineDetail || "Something went wrong.";
+  return "";
+}
+
 function renderBoard(s: GameState): string {
-  const selectedMoves: Move[] = s.selected ? movesFrom(s, s.selected) : [];
+  const canInteract =
+    s.mode !== "online" ||
+    (onlineStatus === "connected" && isMyOnlineTurn() && s.status === "playing");
+  const selectedMoves: Move[] =
+    canInteract && s.selected ? movesFrom(s, s.selected) : [];
   const hintKeys = new Set(selectedMoves.map((m) => coordKey(m.to)));
   const captureHints = new Set(
     selectedMoves.filter((m) => m.captures.length > 0).map((m) => coordKey(m.to)),
@@ -186,12 +479,18 @@ function renderBoard(s: GameState): string {
 
 function renderPlay(s: GameState): string {
   const win = s.status !== "playing";
+  const onlineMeta =
+    s.mode === "online" && online
+      ? `<p class="online-meta">You are ${myOnlineColor()} · Room ${online.roomCode} ${connectionBadge()}</p>`
+      : "";
+
   return `
     <div class="play">
       ${renderBoard(s)}
       <aside class="side">
         <div class="panel">
           <h1>Infinite Checkers</h1>
+          ${onlineMeta}
           <div class="turn-row">
             <span class="turn-dot ${s.turn}" aria-hidden="true"></span>
             <span class="turn-label">${turnName(s)}</span>
@@ -204,7 +503,11 @@ function renderPlay(s: GameState): string {
                 : ""
             }
             <button class="btn" data-action="menu" type="button">Main menu</button>
-            <button class="btn" data-action="restart" type="button">Restart</button>
+            ${
+              s.mode !== "online"
+                ? `<button class="btn" data-action="restart" type="button">Restart</button>`
+                : ""
+            }
           </div>
         </div>
         <div class="panel">
@@ -217,13 +520,25 @@ function renderPlay(s: GameState): string {
             <dd>Jumps may go backward and wrap freely. Chain them when you can.</dd>
           </dl>
         </div>
+        ${renderCredits()}
       </aside>
     </div>
   `;
 }
 
 function render(): void {
-  if (screen === "menu" || !state) {
+  if (screen === "menu") {
+    app.innerHTML = renderMenu();
+    bindMenu();
+    return;
+  }
+  if (screen === "online-lobby") {
+    app.innerHTML = renderOnlineLobby();
+    bindLobby();
+    return;
+  }
+  if (!state) {
+    screen = "menu";
     app.innerHTML = renderMenu();
     bindMenu();
     return;
@@ -240,6 +555,68 @@ function bindMenu(): void {
       startGame(mode, color);
     });
   });
+  app
+    .querySelector<HTMLButtonElement>('[data-action="online-create"]')
+    ?.addEventListener("click", () => openOnlineLobby("create"));
+  app
+    .querySelector<HTMLButtonElement>('[data-action="online-join"]')
+    ?.addEventListener("click", () => openOnlineLobby("join"));
+}
+
+function bindLobby(): void {
+  app.querySelector<HTMLButtonElement>('[data-action="menu"]')?.addEventListener("click", backToMenu);
+
+  app.querySelector<HTMLButtonElement>('[data-action="copy-code"]')?.addEventListener("click", async () => {
+    if (!online) return;
+    await copyText(online.roomCode);
+    copyFeedback = "Code copied.";
+    render();
+  });
+
+  app.querySelector<HTMLButtonElement>('[data-action="copy-link"]')?.addEventListener("click", async () => {
+    if (!online) return;
+    await copyText(roomLink(online.roomCode));
+    copyFeedback = "Link copied.";
+    render();
+  });
+
+  const input = app.querySelector<HTMLInputElement>("#room-code-input");
+  input?.addEventListener("input", () => {
+    joinCodeInput = input.value.toUpperCase();
+  });
+  input?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitJoin();
+  });
+
+  app.querySelector<HTMLButtonElement>('[data-action="join-submit"]')?.addEventListener("click", submitJoin);
+}
+
+function submitJoin(): void {
+  const code = joinCodeInput.trim();
+  if (code.length < 4) {
+    onlineDetail = "Enter the full room code.";
+    onlineStatus = "error";
+    render();
+    return;
+  }
+  destroyOnline();
+  onlineStatus = "connecting";
+  onlineDetail = "Connecting to host…";
+  render();
+  beginGuest(code);
+}
+
+async function copyText(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
 }
 
 function bindPlay(): void {
@@ -253,13 +630,24 @@ function bindPlay(): void {
 
   app.querySelector<HTMLButtonElement>('[data-action="menu"]')?.addEventListener("click", backToMenu);
   app.querySelector<HTMLButtonElement>('[data-action="restart"]')?.addEventListener("click", () => {
-    if (!state) return;
+    if (!state || state.mode === "online") return;
     startGame(state.mode, state.humanPlayer);
   });
   app.querySelector<HTMLButtonElement>('[data-action="rematch"]')?.addEventListener("click", () => {
     if (!state) return;
+    if (state.mode === "online") {
+      requestOnlineRematch();
+      return;
+    }
     startGame(state.mode, state.humanPlayer);
   });
 }
 
-render();
+// Deep-link: ?room=CODE
+const bootRoom = roomCodeFromUrl();
+if (bootRoom) {
+  openOnlineLobby("join", bootRoom);
+  beginGuest(bootRoom);
+} else {
+  render();
+}

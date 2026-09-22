@@ -128,11 +128,19 @@ function maybePromote(piece: Piece, row: number): Piece {
   return piece;
 }
 
-/** Man: quiet diagonal steps (forward only), wrapping. */
+/**
+ * Man: quiet diagonal steps forward only.
+ * Columns may wrap (A3 → H4), but rows must not — otherwise a man on
+ * its back rank could step "around" onto the promotion rank and queen
+ * without crossing the board. Backward / row-wrap travel is capture-only.
+ */
 function manQuietMoves(board: Board, from: Coord, player: Player): Move[] {
   const moves: Move[] = [];
   for (const d of forwardDirs(player)) {
-    const to = { row: wrap(from.row + d.row), col: wrap(from.col + d.col) };
+    const rawRow = from.row + d.row;
+    const rawCol = from.col + d.col;
+    if (rawRow < 0 || rawRow >= BOARD_SIZE) continue;
+    const to = { row: rawRow, col: wrap(rawCol) };
     if (!getPiece(board, to)) {
       moves.push({ from, to, path: [from, to], captures: [] });
     }

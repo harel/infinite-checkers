@@ -80,9 +80,9 @@ function statusText(s: GameState): string {
 
   const hasCaptures = s.legalMoves.some((m) => m.captures.length > 0);
   if (hasCaptures) {
-    return "Capture available — jumps are mandatory. Edges wrap.";
+    return "Capture available — jumps are mandatory (backward + wrap OK).";
   }
-  return "Diagonal moves. Reach an edge and keep going — the board wraps.";
+  return "Men move forward; sides wrap. No top/bottom wrap unless capturing.";
 }
 
 function turnName(s: GameState): string {
@@ -119,10 +119,10 @@ function renderMenu(): string {
       </div>
       <aside class="rules">
         <strong>House rules.</strong>
-        Men move forward diagonally; captures in any diagonal direction.
-        Landing on the far rank promotes to a queen that slides any distance —
-        including across the wrap. Captures are mandatory. Multi-jumps allowed.
-        Example wrap: A3 → H4.
+        Men move forward diagonally; they only go backward when capturing.
+        Columns wrap (A3 → H4), but you can’t wrap the long way around to queen
+        yourself. Captures wrap freely. Reach the far rank across the board to
+        promote. Queens slide any distance. Captures are mandatory.
       </aside>
     </div>
   `;
@@ -210,11 +210,11 @@ function renderPlay(s: GameState): string {
         <div class="panel">
           <dl class="legend">
             <dt>Wrap</dt>
-            <dd>Glowing edges mark the seam. A3 can step to H4.</dd>
+            <dd>Side edges wrap for steps (A3 → H4). Men can’t wrap top/bottom to sneak a queen.</dd>
             <dt>Queens</dt>
             <dd>Slide any number of empty diagonals — including around the board.</dd>
             <dt>Captures</dt>
-            <dd>Jump enemies across the wrap onto the next open square. Chain jumps when you can.</dd>
+            <dd>Jumps may go backward and wrap freely. Chain them when you can.</dd>
           </dl>
         </div>
       </aside>

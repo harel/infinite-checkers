@@ -7,10 +7,11 @@ A browser prototype of wraparound checkers: the board is a torus. Step (or jump)
 ## Rules (this build)
 
 - Standard starting setup; Red moves first
-- Men move forward diagonally; capture in any diagonal direction
-- **Edges wrap** horizontally and vertically for moves and captures
+- Men move forward diagonally; they may only move backward when **capturing**
+- **Side edges wrap** for quiet moves (e.g. A3 → H4). Men cannot wrap top/bottom on a quiet move to reach the promotion rank the long way around
+- Captures wrap freely (horizontal and vertical) and may go backward
 - Captures are mandatory; multi-jumps allowed
-- Reach the far rank → promote to a **queen** that slides any distance on a diagonal (including across the wrap)
+- Reach the far rank across the board → promote to a **queen** that slides any distance on a diagonal (including across the wrap)
 - Modes: two-player pass-and-play, or vs CPU (play as Red or Black)
 
 ## Run
